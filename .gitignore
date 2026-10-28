@@ -1,0 +1,7 @@
+out/
+__pycache__/
+*.pyc
+ana/
+*.mp4
+*.wav
+stills.png

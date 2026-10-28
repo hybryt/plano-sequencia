@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>comp · plano-sequencia</title>
+<!--
+  Composição de exemplo (8 s): um ponto vira barra de prompt, a barra vira janela, a câmera entra
+  na janela, a janela colapsa numa linha e a linha escreve a marca. Nenhum corte.
+  Contrato com o render:
+    window.__ready          Promise: resolve quando fontes e pré-cálculos estão prontos
+    window.__seek(t)        desenha o frame do tempo t (segundos). Pura: mesmo t, mesmo frame
+    window.__meta           {dur, fps, w, h, beats:[t...]}  (beats = fronteiras, pro verify)
+    window.__motion(t0,t1)  opcional: maior deslocamento em px na tela entre t0 e t1 (calibra o blur)
+    window.__events()       opcional: [{t, kind, x?}] pros efeitos sonoros
+  Query: ?play (loop em tempo real) · ?t=3.2 (congela um frame)
+  Troque a copy, a paleta e os beats. Não reaproveite a história desta comp num filme novo.
+-->
+<style>
+  :root { --ground: #f4f1ea; --ink: #16161a; --accent: #ff5a1f; --muted: #8b877d; }
+  html, body { margin: 0; background: var(--ground); overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script src="../lib/ps.js"></script>
+<script>
+const { curve, prog, lerp, clamp, tween, spring, ring, typed, camera, follow, handheld, shake, view, project, rng } = PS;
+const W = 1920, H = 1080, DUR = 8, FPS = 30;
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let C;   // paleta lida do CSS no __ready
+const FONT = '"Inter", "Segoe UI", system-ui, sans-serif';
+
+const PROMPT = 'um filme de 8 segundos, sem cortes';
+const BRAND = 'plano-sequencia';
+
+// Beats (as fronteiras que o verify procura). Durações bem diferentes entre si de propósito.
+const B = { dot: 0, bar: 0.9, type: 1.6, win: 3.6, push: 4.4, line: 6.0, mark: 6.6, end: DUR };
+
+// Retângulos-chave do sujeito (mundo = 1920x1080 no zoom 1).
+const R_DOT = { x: 960, y: 540, w: 22, h: 22, r: 11 };
+const R_BAR = { x: 960, y: 540, w: 760, h: 84, r: 42 };
+const R_WIN = { x: 960, y: 520, w: 1100, h: 640, r: 22 };
+const R_LINE = { x: 960, y: 540, w: 900, h: 6, r: 3 };
+
+function subject(t) {
+  // O mesmo objeto atravessa o filme inteiro: só a forma muda.
+  if (t < B.bar) return { ...R_DOT, ...popScale(t) };
+  if (t < B.win) return PS.morph(t, B.bar, B.bar + 0.55, R_DOT, R_BAR, curve.expoOut);
+  if (t < B.line) return PS.morph(t, B.win, B.win + 0.7, R_BAR, R_WIN, curve.expoInOut);
+  return PS.morph(t, B.line, B.line + 0.45, R_WIN, R_LINE, curve.expoIn);
+}
+function popScale(t) {
+  const s = Math.max(0, spring(t - 0.15, { freq: 2.2, damp: 0.42 }));
+  return { w: R_DOT.w * s, h: R_DOT.h * s };
+}
+
+// Câmera: o operador persegue o que cada beat enquadra.
+function want(t) {
+  if (t < B.win) return { x: 960, y: 540, zoom: t < B.bar ? 2.2 : 1.15 };
+  if (t < B.push) return { x: 960, y: 520, zoom: 1 };
+  if (t < B.line) return { x: 760, y: 430, zoom: 2.1 };     // entra no conteúdo da janela
+  return { x: 960, y: 540, zoom: 1 };
+}
+let CAM;
+const HITS = [{ t: B.bar, amp: 6 }, { t: B.line + 0.45, amp: 14 }, { t: B.mark + 0.9, amp: 5 }];
+function cam(t) {
+  const c = CAM(t), h = handheld(t, { amp: 3 }), s = shake(t, HITS);
+  return { x: c.x + h.x + s.x, y: c.y + h.y + s.y, zoom: c.zoom, rot: h.rot };
+}
+
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.roundRect(x - w / 2, y - h / 2, w, h, r);
+}
+
+function draw(t) {
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.fillStyle = C.ground; g.fillRect(0, 0, W, H);
+  const c = cam(t);
+  g.setTransform(...view(c));
+
+  const S = subject(t);
+  // corpo do sujeito
+  const toWin = prog(t, B.win, B.win + 0.7);
+  g.fillStyle = t < B.bar ? C.accent : (t >= B.line ? C.ink : '#ffffff');
+  g.shadowColor = 'rgba(0,0,0,0.12)'; g.shadowBlur = t >= B.bar && t < B.line ? 40 : 0; g.shadowOffsetY = 12;
+  if (t >= B.line) g.fillStyle = '#ffffff';
+  rr(S.x, S.y, S.w, S.h, S.r); g.fill();
+  g.shadowBlur = 0; g.shadowOffsetY = 0;
+  // a janela escurece enquanto vira linha (sem troca seca de cor)
+  if (t >= B.line) { g.globalAlpha = curve.cubicIn(prog(t, B.line, B.line + 0.4)); g.fillStyle = C.ink; rr(S.x, S.y, S.w, S.h, S.r); g.fill(); g.globalAlpha = 1;
+    // contorno fixo: no meio do escurecimento o cinza bate com o fundo e a janela sumiria por um frame
+    g.strokeStyle = C.ink; g.lineWidth = 3; rr(S.x, S.y, S.w, S.h, S.r); g.stroke(); }
+  if (t >= B.bar && t < B.line) { g.strokeStyle = 'rgba(0,0,0,0.08)'; g.lineWidth = 2; g.stroke(); }
+
+  // texto do prompt (vive dentro da barra, sobe pro topo da janela)
+  if (t >= B.type && t < B.line) {
+    const txt = typed(t, B.type, PROMPT, { cps: 22 });
+    const y = lerp(S.y, S.y - S.h / 2 + 46, curve.expoInOut(toWin));
+    const x = S.x - S.w / 2 + 44;
+    g.font = `500 ${lerp(30, 22, toWin)}px ${FONT}`; g.textBaseline = 'middle';
+    g.fillStyle = C.ink; g.fillText(txt, x, y);
+    const caretOn = Math.floor(t * 2.4) % 2 === 0 || t < B.win;
+    if (caretOn && t < B.win + 0.3) { const w = g.measureText(txt).width; g.fillStyle = C.accent; g.fillRect(x + w + 4, y - 17, 3, 34); }
+  }
+
+  // conteúdo da janela: cresce de dentro dela, não entra de fora
+  if (t >= B.win + 0.2 && t < B.line + 0.2) {
+    const fade = 1 - prog(t, B.line - 0.1, B.line + 0.15);
+    const x0 = S.x - S.w / 2 + 44, y0 = S.y - S.h / 2 + 100;
+    for (let i = 0; i < 6; i++) {
+      const u = curve.expoOut(prog(t, B.win + 0.3 + i * 0.09, B.win + 0.9 + i * 0.09));
+      g.globalAlpha = u * fade;
+      g.fillStyle = i === 0 ? C.accent : '#e7e3da';
+      const w = (i === 0 ? 420 : 300 + ((i * 137) % 5) * 90) * u;
+      g.beginPath(); g.roundRect(x0, y0 + i * 70 + (1 - u) * 20, w, 34, 8); g.fill();
+    }
+    // o "frame" do filme: um quadro com uma barra de progresso andando
+    const u = curve.expoOut(prog(t, B.win + 0.5, B.win + 1.2));
+    g.globalAlpha = u * fade;
+    g.fillStyle = C.ink; g.beginPath(); g.roundRect(S.x + 70, y0, 380 * u, 214, 14); g.fill();
+    g.fillStyle = C.accent; g.fillRect(S.x + 90, y0 + 180, 340 * u * prog(t, B.push, B.line), 6);
+    g.globalAlpha = 1;
+  }
+
+  // a linha escreve a marca: as letras nascem da linha
+  if (t >= B.mark - 0.1) {
+    g.font = `700 112px ${FONT}`; g.textBaseline = 'alphabetic'; g.textAlign = 'center';
+    const total = g.measureText(BRAND).width;
+    let x = 960 - total / 2;
+    for (let i = 0; i < BRAND.length; i++) {
+      const ch = BRAND[i], w = g.measureText(ch).width;
+      const t0 = B.mark + i * 0.035;
+      const s = Math.max(0, spring(t - t0, { freq: 2.6, damp: 0.5 }));
+      g.save(); g.translate(x + w / 2, 530); g.scale(1, s); g.fillStyle = C.ink; g.fillText(ch, 0, 0); g.restore();
+      x += w;
+    }
+    g.textAlign = 'left';
+    const tag = clamp((t - (B.mark + 0.9)) * 3);
+    g.globalAlpha = tag; g.font = `500 30px ${FONT}`; g.fillStyle = C.muted; g.textAlign = 'center';
+    g.fillText('motion sem cortes', 960, 610 + (1 - tag) * 10); g.textAlign = 'left'; g.globalAlpha = 1;
+  }
+}
+
+// Maior deslocamento na tela entre t0 e t1: o canto do sujeito e o centro da câmera.
+function motion(t0, t1) {
+  const pts = t => { const c = cam(t), S = subject(t); return [project(c, { x: S.x - S.w / 2, y: S.y - S.h / 2 }), project(c, { x: S.x + S.w / 2, y: S.y + S.h / 2 })]; };
+  const a = pts(t0), b = pts(t1);
+  return Math.max(...a.map((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y)));
+}
+
+window.__meta = { dur: DUR, fps: FPS, w: W, h: H, beats: [B.bar, B.type, B.win, B.push, B.line, B.mark] };
+window.__seek = async t => { draw(t); return true; };
+window.__motion = motion;
+window.__events = () => [
+  { t: 0.15, kind: 'pop' }, { t: B.bar, kind: 'whoosh' },
+  ...Array.from(PROMPT).map((_, i) => ({ t: B.type + i / 22, kind: 'tick' })).filter((_, i) => i % 3 === 0),
+  { t: B.win, kind: 'whoosh' }, { t: B.push, kind: 'whoosh' },
+  { t: B.line + 0.45, kind: 'thud' }, { t: B.mark + 0.9, kind: 'chime' },
+];
+window.__ready = (async () => {
+  try { await document.fonts.load(`700 112px ${FONT}`); } catch (e) {}
+  await document.fonts.ready;
+  C = { ground: css('--ground'), ink: css('--ink'), accent: css('--accent'), muted: css('--muted') };
+  CAM = follow(want, { dur: DUR, freq: 1.1, damp: 0.92 });
+  draw(0);
+  return true;
+})();
+
+const q = new URLSearchParams(location.search);
+if (q.has('t')) __ready.then(() => draw(parseFloat(q.get('t'))));
+if (q.has('play')) __ready.then(() => { const t0 = performance.now(); (function loop() { draw(((performance.now() - t0) / 1000) % DUR); requestAnimationFrame(loop); })(); });
+</script>
+</body>
+</html>
